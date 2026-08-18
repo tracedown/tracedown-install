@@ -7,13 +7,17 @@
 # piped in. Every prompt can be pre-answered with a TD_* environment variable
 # (named next to each prompt below) for unattended installs.
 #
-# Three things it can do:
+# Four things it can do:
 #   1) Monolith     — the whole platform in one container, plus Postgres and
 #                     Redis. The smallest real installation.
 #   2) Full stack   — the per-service deployment from the published release
 #                     artifacts (the docker/deploy stack: 11 containers).
+#                     Optionally installs the host nginx config for you.
 #   3) Probe agent  — mint a bootstrap token on an existing full stack and
 #                     connect an agent to it.
+#   4) Kubernetes   — the monolith on a cluster: generates plain manifests
+#                     (namespace, secrets, Postgres, Redis, monolith, optional
+#                     Ingress) and applies them via kubectl if you want.
 #
 # Everything lands in a directory you choose; nothing outside it is touched
 # apart from Docker resources. Re-running is safe: it refuses to clobber an
@@ -314,13 +318,62 @@ install_full() {
   docker compose up -d
   wait_for_ping "http://127.0.0.1:20714/ping" 300 || true
 
-  say "Done — two steps remain:"
-  note "1. Expose it: copy nginx.conf or apache.conf from $(pwd) into your web"
-  note "   server, adjust server_name and the frontend-dist path, add TLS"
-  note "   (certbot), reload. The stack itself binds 127.0.0.1 only."
-  note "2. Connect a probe agent — nothing probes without one:"
-  note "     curl -fsSL ${DOCS}/install.sh | bash    (choose option 3)"
+  offer_host_nginx "$TD_APP_URL"
+
+  say "Done — what remains:"
+  if [ "${HOST_CONF_INSTALLED:-no}" != "yes" ]; then
+    note "- Expose it: copy nginx.conf or apache.conf from $(pwd) into your web"
+    note "  server, adjust server_name and the frontend-dist path, add TLS"
+    note "  (certbot), reload. The stack itself binds 127.0.0.1 only."
+  else
+    note "- Add TLS: certbot --nginx (or install your internal certificates)."
+  fi
+  note "- Connect a probe agent — nothing probes without one:"
+  note "    curl -fsSL ${DOCS}/install.sh | bash    (choose option 3)"
   note "Docs: ${DOCS}/install/deploy/"
+}
+
+# Offers to install the stack's nginx vhost on THIS host: fills in server_name
+# and the frontend path, writes tracedown.conf into the nginx config tree,
+# tests, reloads. Skipped silently when nginx isn't installed here (the stack
+# may be fronted from another machine). TD_NGINX_ROOT overrides /etc/nginx for
+# tests.
+offer_host_nginx() {
+  local app_url="$1" server_name conf_root confdir target sudo_cmd=""
+  command -v nginx >/dev/null 2>&1 || { note "(nginx not found on this host — skipping the vhost offer.)"; return 0; }
+
+  prompt TD_HOST_CONF "nginx is installed here. Write and enable the Tracedown vhost now? (yes/no)" "yes"
+  case "$TD_HOST_CONF" in y|yes|Y|YES) ;; *) return 0 ;; esac
+
+  server_name="$(printf '%s' "$app_url" | sed -E 's|^https?://||; s|/.*$||')"
+  prompt TD_SERVER_NAME "server_name for the vhost" "$server_name"
+
+  conf_root="${TD_NGINX_ROOT:-/etc/nginx}"
+  if [ -d "$conf_root/sites-available" ]; then
+    target="$conf_root/sites-available/tracedown.conf"
+  else
+    target="$conf_root/conf.d/tracedown.conf"
+  fi
+  [ -w "$(dirname "$target")" ] || sudo_cmd="sudo"
+  [ -z "$sudo_cmd" ] || command -v sudo >/dev/null 2>&1 || { warn "Need root to write $target — copy nginx.conf manually."; return 0; }
+
+  say "Writing $target ..."
+  sed -e "s|server_name .*;|server_name ${TD_SERVER_NAME};|" \
+      -e "s|root /opt/tracedown/deploy/frontend-dist;|root $(pwd)/frontend-dist;|" \
+      nginx.conf | $sudo_cmd tee "$target" > /dev/null
+  if [ -d "$conf_root/sites-available" ] && [ -d "$conf_root/sites-enabled" ]; then
+    $sudo_cmd ln -sf "$target" "$conf_root/sites-enabled/tracedown.conf"
+  fi
+
+  if [ -n "${TD_NGINX_ROOT:-}" ]; then
+    note "(custom TD_NGINX_ROOT — skipping nginx -t / reload)"
+  elif $sudo_cmd nginx -t; then
+    $sudo_cmd systemctl reload nginx 2>/dev/null || $sudo_cmd nginx -s reload
+    say "nginx reloaded — http://${TD_SERVER_NAME}/ serves the stack (HTTP only; add TLS next)."
+    HOST_CONF_INSTALLED=yes
+  else
+    warn "nginx -t failed — the vhost was written to $target but NOT reloaded. Fix and reload manually."
+  fi
 }
 
 # ── mode 3: probe agent ──────────────────────────────────────────────────────
@@ -366,26 +419,292 @@ install_agent() {
   note "Docs: ${DOCS}/install/agents/"
 }
 
+# ── mode 4: kubernetes (monolith) ────────────────────────────────────────────
+
+install_k8s() {
+  say "Kubernetes: the monolith on a cluster — plain manifests, no Helm required."
+  note "(The per-service stack on Kubernetes is a chart-sized project; the"
+  note " monolith is the supported cluster install today.)"
+
+  prompt TD_DIR       "Directory for the generated manifests" "$HOME/tracedown-k8s"
+  prompt TD_VERSION   "Backend version (or 'latest')"         "latest"
+  prompt TD_NAMESPACE "Namespace"                             "tracedown"
+  prompt TD_INGRESS_HOST "Ingress host (empty: no Ingress — use port-forward)" ""
+  prompt TD_DEMO_EMAIL    "Admin login email"                 "admin@tracedown.dev"
+  prompt TD_DEMO_PASSWORD "Admin login password"              "Down2trace!"
+  prompt_email
+
+  [ "$TD_VERSION" = "latest" ] && TD_VERSION="$(latest_backend_version)"
+  [ -n "$TD_VERSION" ] || die "Could not resolve the latest release."
+  confirm_dir "$TD_DIR"; cd "$TD_DIR"
+
+  local deploy_env="" ws_url=""
+  [ "$TD_EMAIL_MODE" = "smtp" ] && deploy_env="production"
+  [ -n "$TD_INGRESS_HOST" ] && ws_url="/ws"
+  local jar_url="https://github.com/${BACKEND_REPO}/releases/download/v${TD_VERSION}/tracedown-monolith-${TD_VERSION}-all.jar"
+
+  say "Writing tracedown.yaml (version ${TD_VERSION}) ..."
+  cat > tracedown.yaml <<YAML
+# Tracedown monolith on Kubernetes — generated by install.sh.
+# Secrets are generated once, below; PLATFORM_AES_KEY is permanent (it
+# encrypts stored secrets and cannot be rotated) — back this file up, or move
+# the Secret into your secret manager.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${TD_NAMESPACE}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tracedown-secrets
+  namespace: ${TD_NAMESPACE}
+stringData:
+  PLATFORM_AES_KEY: "$(hex32)"
+  JWT_SECRET: "$(b64secret)"
+  DB_PASSWORD: "$(openssl rand -hex 16)"
+  DEMO_USER_EMAIL: "${TD_DEMO_EMAIL}"
+  DEMO_USER_PASSWORD: "${TD_DEMO_PASSWORD}"
+  SMTP_PASSWORD: "${TD_SMTP_PASSWORD:-}"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tracedown-pgdata, namespace: ${TD_NAMESPACE} }
+spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 10Gi } } }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tracedown-redis, namespace: ${TD_NAMESPACE} }
+spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 2Gi } } }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tracedown-bodies, namespace: ${TD_NAMESPACE} }
+spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 5Gi } } }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ${TD_NAMESPACE}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_DB, value: tracedown }
+            - { name: POSTGRES_USER, value: tracedown }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: DB_PASSWORD } }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: pgdata, mountPath: /var/lib/postgresql/data }]
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim: { claimName: tracedown-pgdata }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: ${TD_NAMESPACE} }
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: ${TD_NAMESPACE}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["redis-server", "--appendonly", "yes"]
+          ports: [{ containerPort: 6379 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: tracedown-redis }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: ${TD_NAMESPACE} }
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tracedown
+  namespace: ${TD_NAMESPACE}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: tracedown } }
+  template:
+    metadata: { labels: { app: tracedown } }
+    spec:
+      initContainers:
+        # The release jar is fetched at pod start — upgrading is editing the
+        # URL below (or regenerating with a newer version) and restarting.
+        - name: fetch
+          image: curlimages/curl:latest
+          args: ["-fsSL", "-o", "/app/monolith.jar", "${jar_url}"]
+          volumeMounts: [{ name: app, mountPath: /app }]
+      containers:
+        - name: monolith
+          image: eclipse-temurin:17-jre
+          command: ["java", "-jar", "/app/monolith.jar"]
+          env:
+            - { name: DATABASE_URL, value: "jdbc:postgresql://postgres:5432/tracedown" }
+            - { name: DATABASE_USER, value: tracedown }
+            - name: DATABASE_PASSWORD
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: DB_PASSWORD } }
+            - { name: REDIS_A_URL, value: "redis://redis:6379" }
+            - name: PLATFORM_AES_KEY
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: PLATFORM_AES_KEY } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: JWT_SECRET } }
+            - name: DEMO_USER_EMAIL
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: DEMO_USER_EMAIL } }
+            - name: DEMO_USER_PASSWORD
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: DEMO_USER_PASSWORD } }
+            - { name: STORAGE_FILESYSTEM_ROOT, value: /data/bodies }
+            - { name: DEPLOYMENT_ENV, value: "${deploy_env}" }
+            - { name: WS_URL, value: "${ws_url}" }
+            - { name: EMAIL_PROVIDER, value: "${TD_EMAIL_MODE/none/console}" }
+            - { name: EMAIL_FROM_ADDRESS, value: "${TD_EMAIL_FROM:-}" }
+            - { name: SMTP_HOST, value: "${TD_SMTP_HOST:-}" }
+            - { name: SMTP_PORT, value: "${TD_SMTP_PORT:-587}" }
+            - { name: SMTP_USERNAME, value: "${TD_SMTP_USERNAME:-}" }
+            - name: SMTP_PASSWORD
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: SMTP_PASSWORD } }
+            - { name: EMAIL_SMTP_HOST, value: "${TD_SMTP_HOST:-}" }
+            - { name: EMAIL_SMTP_PORT, value: "${TD_SMTP_PORT:-587}" }
+            - { name: EMAIL_SMTP_USERNAME, value: "${TD_SMTP_USERNAME:-}" }
+            - name: EMAIL_SMTP_PASSWORD
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: SMTP_PASSWORD } }
+          ports:
+            - { containerPort: 20714 }
+            - { containerPort: 20870 }
+          readinessProbe:
+            httpGet: { path: /ping, port: 20714 }
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          volumeMounts:
+            - { name: app, mountPath: /app }
+            - { name: bodies, mountPath: /data/bodies }
+      volumes:
+        - name: app
+          emptyDir: {}
+        - name: bodies
+          persistentVolumeClaim: { claimName: tracedown-bodies }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: tracedown, namespace: ${TD_NAMESPACE} }
+spec:
+  selector: { app: tracedown }
+  ports:
+    - { name: http, port: 20714 }
+    - { name: ws, port: 20870 }
+YAML
+
+  if [ -n "$TD_INGRESS_HOST" ]; then
+    cat >> tracedown.yaml <<YAML
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tracedown
+  namespace: ${TD_NAMESPACE}
+  # Add TLS (cert-manager annotation + tls block) before real users.
+spec:
+  rules:
+    - host: ${TD_INGRESS_HOST}
+      http:
+        paths:
+          - path: /ws
+            pathType: Prefix
+            backend: { service: { name: tracedown, port: { number: 20870 } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: tracedown, port: { number: 20714 } } }
+YAML
+  fi
+
+  if [ "$TD_EMAIL_MODE" != "smtp" ]; then
+    warn "No email provider: mail stays in the pod logs and the production"
+    warn "startup guards are NOT armed. Edit the manifest (EMAIL_* / DEPLOYMENT_ENV)"
+    warn "and kubectl apply again before real users."
+  fi
+
+  if command -v kubectl >/dev/null 2>&1; then
+    local ctx
+    ctx="$(kubectl config current-context 2>/dev/null || echo '(none)')"
+    # Deliberately defaults to no: applying to whatever context happens to be
+    # current is the kind of surprise a cluster admin does not want.
+    prompt TD_K8S_APPLY "Apply to kubectl context '${ctx}' now? (yes/no)" "no"
+    case "$TD_K8S_APPLY" in
+      y|yes|Y|YES)
+        kubectl apply -f tracedown.yaml
+        say "Applied. Watch: kubectl -n ${TD_NAMESPACE} rollout status deploy/tracedown"
+        ;;
+      *) note "Not applied — review $(pwd)/tracedown.yaml and apply when ready." ;;
+    esac
+  else
+    note "kubectl not found — manifests written to $(pwd)/tracedown.yaml; apply from a machine with cluster access."
+  fi
+
+  say "Done."
+  if [ -n "$TD_INGRESS_HOST" ]; then
+    note "Dashboard: http://${TD_INGRESS_HOST}/ once the Ingress resolves (add TLS!)."
+  else
+    note "No Ingress: kubectl -n ${TD_NAMESPACE} port-forward svc/tracedown 20714:20714"
+    note "then open http://127.0.0.1:20714"
+  fi
+  note "Docs: ${DOCS}/install/monolith/"
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 printf '\n  Tracedown installer — self-hosted API monitoring\n  %s\n\n' "$DOCS"
 
-need curl; need docker; need openssl
-docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required ('docker compose', not 'docker-compose')."
-docker info >/dev/null 2>&1 || die "Docker is installed but not usable by this user (daemon down, or missing group membership)."
+need curl; need openssl
 
 TD_MODE="${TD_MODE-}"
 if [ -z "$TD_MODE" ]; then
   note "1) Monolith    — everything in one container + Postgres + Redis (smallest install)"
   note "2) Full stack  — the per-service deployment (11 containers, production shape)"
   note "3) Probe agent — connect an agent to an existing full stack"
+  note "4) Kubernetes  — the monolith on a cluster (generates plain manifests)"
   printf '\n'
   prompt TD_MODE "Which one?" "1"
+fi
+
+# Docker is only a prerequisite for the docker-based modes.
+if [ "$TD_MODE" != "4" ]; then
+  need docker
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required ('docker compose', not 'docker-compose')."
+  docker info >/dev/null 2>&1 || die "Docker is installed but not usable by this user (daemon down, or missing group membership)."
 fi
 
 case "$TD_MODE" in
   1) install_monolith ;;
   2) install_full ;;
   3) install_agent ;;
-  *) die "Unknown choice '$TD_MODE' (expected 1, 2 or 3)." ;;
+  4) install_k8s ;;
+  *) die "Unknown choice '$TD_MODE' (expected 1, 2, 3 or 4)." ;;
 esac
