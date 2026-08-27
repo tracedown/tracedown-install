@@ -30,6 +30,7 @@ install_agent() {
     --hostname "$TD_SLUG" \
     --network tracedown_tracedown-net --network-alias "$TD_SLUG" \
     -v tracedown_tracedown-bodies:/data/bodies \
+    -v "tracedown-agent-${TD_SLUG}-certs:/certs" \
     -e PROBE_AGENT_BOOTSTRAP_TOKEN="$token" \
     -e PROBE_AGENT_SCHEDULER_URL=http://tracedown-gateway:20714 \
     -e PROBE_AGENT_PORT=8443 \
@@ -39,6 +40,9 @@ install_agent() {
     "$TD_AGENT_IMAGE" >/dev/null
 
   say "Agent '${TD_SLUG}' started."
+  note "Its enrolled identity (keypair and signed certificate) lives in the"
+  note "tracedown-agent-${TD_SLUG}-certs volume, so replacing or upgrading the"
+  note "container keeps it. Removing that volume means a fresh bootstrap token."
   note "It enrolls over mutual TLS and reports healthy after its first health"
   note "challenge (about a minute). Watch: docker logs -f tracedown-agent-${TD_SLUG}"
   note "Docs: ${DOCS}/install/agents/"

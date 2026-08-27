@@ -9,9 +9,7 @@ install_full() {
   prompt TD_DIR      "Install directory"             "$HOME/tracedown"
   prompt TD_VERSION  "Backend version (or 'latest')" "latest"
   prompt TD_APP_URL  "Public base URL (what users' browsers will reach)" "https://tracedown.example.com"
-  prompt TD_DEMO_EMAIL    "Admin login email"        "admin@tracedown.dev"
-  prompt TD_DEMO_PASSWORD "Admin login password"     ""
-  [ -n "$TD_DEMO_PASSWORD" ] || die "An admin password is required for the production stack."
+  prompt_admin
   prompt_email
 
   local tag="$TD_VERSION"
@@ -36,6 +34,7 @@ install_full() {
       -e "s|^#PLATFORM_AES_KEY=.*|PLATFORM_AES_KEY=$(hex32)|" \
       -e "s|^#JWT_SECRET=.*|JWT_SECRET=$(b64secret)|" \
       -e "s|^APP_URL=.*|APP_URL=${TD_APP_URL}|" \
+      -e "s|^#SINGLE_ORG_MODE=.*|SINGLE_ORG_MODE=true|" \
       -e "s|^#DEMO_USER_EMAIL=.*|DEMO_USER_EMAIL=${TD_DEMO_EMAIL}|" \
       -e "s|^#DEMO_USER_PASSWORD=.*|DEMO_USER_PASSWORD=${TD_DEMO_PASSWORD}|" \
       -e "s|^BACKEND_VERSION=.*|BACKEND_VERSION=${tag}|" \
@@ -62,19 +61,35 @@ install_full() {
       warn "guards are NOT armed. Configure SMTP in .env and set"
       warn "DEPLOYMENT_ENV=production before real users."
     fi
+    # Every line above is a sed against a template fetched from the release, so
+    # a renamed or reworded key would silently leave the setting commented out
+    # and the install would come up with no account and no explanation. The
+    # bootstrap trio is the set that has no recovery path, so assert it landed.
+    local missing="" key
+    for key in SINGLE_ORG_MODE DEMO_USER_EMAIL DEMO_USER_PASSWORD; do
+      grep -q "^${key}=." .env || missing="$missing $key"
+    done
+    [ -z "$missing" ] || die "The v${tag} .env template did not accept:${missing}. Set them by hand in $(pwd)/.env before starting — nothing else can create the first user."
+
     chmod 600 .env
     note "PLATFORM_AES_KEY is permanent — back .env up separately from the database."
   else
     note "Reusing existing .env"
+    grep -q '^SINGLE_ORG_MODE=' .env || warn \
+      "This .env has no SINGLE_ORG_MODE. If no account exists yet, uncomment SINGLE_ORG_MODE=true (with real DEMO_USER_* values) before starting — nothing else can create the first user."
   fi
 
   say "Starting (docker compose up -d) — first start downloads the release artifacts ..."
   docker compose up -d
-  wait_for_ping "http://127.0.0.1:20714/ping" 300 || true
+  # /health, not /ping: /ping is static liveness and answers long before the
+  # migrator has finished and the pools are up. /health is readiness and 503s
+  # until the gateway can actually serve.
+  wait_for_ping "http://127.0.0.1:20714/health" 300 || true
 
   offer_host_nginx "$TD_APP_URL"
 
   say "Done — what remains:"
+  report_first_login "$TD_APP_URL" "$(pwd)/.env"
   if [ "${HOST_CONF_INSTALLED:-no}" != "yes" ]; then
     note "- Expose it: copy nginx.conf or apache.conf from $(pwd) into your web"
     note "  server, adjust server_name and the frontend-dist path, add TLS"
