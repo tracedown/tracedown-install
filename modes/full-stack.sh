@@ -43,10 +43,6 @@ install_full() {
       sed -i \
         -e "s|^#EMAIL_PROVIDER=.*|EMAIL_PROVIDER=smtp|" \
         -e "s|^#EMAIL_FROM_ADDRESS=.*|EMAIL_FROM_ADDRESS=${TD_EMAIL_FROM}|" \
-        -e "s|^#SMTP_HOST=.*|SMTP_HOST=${TD_SMTP_HOST}|" \
-        -e "s|^#SMTP_PORT=.*|SMTP_PORT=${TD_SMTP_PORT}|" \
-        -e "s|^#SMTP_USERNAME=.*|SMTP_USERNAME=${TD_SMTP_USERNAME}|" \
-        -e "s|^#SMTP_PASSWORD=.*|SMTP_PASSWORD=${TD_SMTP_PASSWORD}|" \
         -e "s|^#EMAIL_SMTP_HOST=.*|EMAIL_SMTP_HOST=${TD_SMTP_HOST}|" \
         -e "s|^#EMAIL_SMTP_PORT=.*|EMAIL_SMTP_PORT=${TD_SMTP_PORT}|" \
         -e "s|^#EMAIL_SMTP_USERNAME=.*|EMAIL_SMTP_USERNAME=${TD_SMTP_USERNAME}|" \
