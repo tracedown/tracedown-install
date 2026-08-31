@@ -12,8 +12,11 @@ install_monolith() {
   prompt TD_VERSION  "Backend version (or 'latest')"            "latest"
   prompt TD_GATEWAY_PORT  "Gateway port (dashboard + API)"      "20714"
   prompt TD_REALTIME_PORT "WebSocket port"                      "20870"
-  prompt TD_DEMO_EMAIL    "Admin login email"                   "admin@tracedown.dev"
-  prompt TD_DEMO_PASSWORD "Admin login password"                "Down2trace!"
+  # Invite and password-reset mails are built from this. It has to be the URL a
+  # browser can actually reach, not the loopback the container binds — a link
+  # to 127.0.0.1 is useless in someone else's inbox.
+  prompt TD_APP_URL  "Public base URL (what users' browsers will reach)" "http://127.0.0.1:${TD_GATEWAY_PORT}"
+  prompt_admin
   prompt_email
 
   [ "$TD_VERSION" = "latest" ] && TD_VERSION="$(latest_backend_version)"
@@ -35,6 +38,11 @@ JWT_SECRET=$(b64secret)
 DB_PASSWORD=$(openssl rand -hex 16)
 GATEWAY_PORT=${TD_GATEWAY_PORT}
 REALTIME_PORT=${TD_REALTIME_PORT}
+APP_URL=${TD_APP_URL}
+# First-run bootstrap: creates the organization below and its owner. This is
+# the only way to get the first account — invites and --create-org both need a
+# user to exist. Set it to false once you have signed in, then 'up -d' again.
+SINGLE_ORG_MODE=true
 DEMO_USER_EMAIL=${TD_DEMO_EMAIL}
 DEMO_USER_PASSWORD=${TD_DEMO_PASSWORD}
 ENV
@@ -64,6 +72,8 @@ ENV
     chmod 600 .env
   else
     note "Reusing existing .env"
+    grep -q '^SINGLE_ORG_MODE=' .env || warn \
+      "This .env has no SINGLE_ORG_MODE. If no account exists yet, add SINGLE_ORG_MODE=true (with real DEMO_USER_* values) before starting — nothing else can create the first user."
   fi
 
   cat > docker-compose.yml <<'YML'
@@ -102,7 +112,11 @@ services:
       # Everything below passes through from .env — edit there, `up -d` again.
       DEPLOYMENT_ENV: ${DEPLOYMENT_ENV:-}
       EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console}
-      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      # These two repeat the platform's OWN defaults rather than "". A key
+      # present here always reaches the process, and the platform treats a
+      # defined-but-empty value as an override — an empty APP_URL turns every
+      # invite and password-reset link in outgoing mail into a bare path.
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-noreply@tracedown.dev}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
@@ -112,8 +126,12 @@ services:
       EMAIL_SMTP_USERNAME: ${EMAIL_SMTP_USERNAME:-}
       EMAIL_SMTP_PASSWORD: ${EMAIL_SMTP_PASSWORD:-}
       WS_URL: ${WS_URL:-}
-      APP_URL: ${APP_URL:-}
+      APP_URL: ${APP_URL:-http://localhost:5173}
       STORAGE_FILESYSTEM_ROOT: /data/bodies
+      # Compose does NOT hand .env to the container — only to the interpolation
+      # on the right of these colons. A variable missing from this map never
+      # reaches the process, however carefully .env sets it.
+      SINGLE_ORG_MODE: ${SINGLE_ORG_MODE:-false}
       DEMO_USER_EMAIL: ${DEMO_USER_EMAIL}
       DEMO_USER_PASSWORD: ${DEMO_USER_PASSWORD}
     ports:
@@ -130,10 +148,14 @@ YML
 
   say "Starting (docker compose up -d) ..."
   docker compose up -d
-  wait_for_ping "http://127.0.0.1:${TD_GATEWAY_PORT}/ping" 180 || true
+  # /health, not /ping: /ping is static liveness and answers as soon as the
+  # event loop is up, which is well before the database is migrated and
+  # reachable. /health is the readiness endpoint and 503s until it is.
+  wait_for_ping "http://127.0.0.1:${TD_GATEWAY_PORT}/health" 180 || true
 
   say "Done."
-  note "Dashboard:  http://127.0.0.1:${TD_GATEWAY_PORT}  (log in as ${TD_DEMO_EMAIL})"
+  note "Dashboard:  http://127.0.0.1:${TD_GATEWAY_PORT}"
+  report_first_login "http://127.0.0.1:${TD_GATEWAY_PORT}" "${TD_DIR}/.env"
   note "Both ports bind 127.0.0.1 only — put your web server in front for the"
   note "network: proxy / to ${TD_GATEWAY_PORT} and /ws (WebSocket) to ${TD_REALTIME_PORT},"
   note "and set WS_URL=/ws in .env so the dashboard connects same-origin."

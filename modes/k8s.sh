@@ -13,17 +13,21 @@ install_k8s() {
   prompt TD_NAMESPACE "Namespace"                             "tracedown"
   prompt TD_INGRESS_HOST "Ingress host (empty or 'none': no Ingress — use port-forward)" "none"
   [ "$TD_INGRESS_HOST" = "none" ] && TD_INGRESS_HOST=""
-  prompt TD_DEMO_EMAIL    "Admin login email"                 "admin@tracedown.dev"
-  prompt TD_DEMO_PASSWORD "Admin login password"              "Down2trace!"
+  prompt_admin
   prompt_email
 
   [ "$TD_VERSION" = "latest" ] && TD_VERSION="$(latest_backend_version)"
   [ -n "$TD_VERSION" ] || die "Could not resolve the latest release."
   confirm_dir "$TD_DIR"; cd "$TD_DIR"
 
-  local deploy_env="" ws_url=""
+  local deploy_env="" ws_url="" app_url=""
   [ "$TD_EMAIL_MODE" = "smtp" ] && deploy_env="production"
   [ -n "$TD_INGRESS_HOST" ] && ws_url="/ws"
+  # Invite and password-reset mails are built from APP_URL. With an Ingress it
+  # is that host; without one the only way in is the port-forward this mode
+  # prints at the end, so say so rather than leave it empty — the platform
+  # treats a defined-but-empty value as an override and would emit bare paths.
+  if [ -n "$TD_INGRESS_HOST" ]; then app_url="http://${TD_INGRESS_HOST}"; else app_url="http://127.0.0.1:20714"; fi
   local jar_url="https://github.com/${BACKEND_REPO}/releases/download/v${TD_VERSION}/tracedown-monolith-${TD_VERSION}-all.jar"
 
   say "Writing tracedown.yaml (version ${TD_VERSION}) ..."
@@ -86,6 +90,20 @@ spec:
             - name: POSTGRES_PASSWORD
               valueFrom: { secretKeyRef: { name: tracedown-secrets, key: DB_PASSWORD } }
           ports: [{ containerPort: 5432 }]
+          # Postgres serves no /health of its own; pg_isready is the readiness
+          # answer and an open socket the liveness one. Without these the
+          # database counts as Ready the instant the container starts, and the
+          # monolith's first connection attempt races initdb.
+          livenessProbe:
+            tcpSocket: { port: 5432 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "tracedown", "-d", "tracedown"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
           volumeMounts: [{ name: pgdata, mountPath: /var/lib/postgresql/data }]
       volumes:
         - name: pgdata
@@ -115,6 +133,16 @@ spec:
           image: redis:7-alpine
           args: ["redis-server", "--appendonly", "yes"]
           ports: [{ containerPort: 6379 }]
+          livenessProbe:
+            tcpSocket: { port: 6379 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
           volumeMounts: [{ name: data, mountPath: /data }]
       volumes:
         - name: data
@@ -160,6 +188,12 @@ spec:
               valueFrom: { secretKeyRef: { name: tracedown-secrets, key: PLATFORM_AES_KEY } }
             - name: JWT_SECRET
               valueFrom: { secretKeyRef: { name: tracedown-secrets, key: JWT_SECRET } }
+            # First-run bootstrap: creates the organization and its owner from
+            # the two values below. Nothing else in the platform can create the
+            # first user, and a Deployment env map is the only thing the
+            # process reads — there is no .env here. Set it to "false" and
+            # re-apply once you have signed in.
+            - { name: SINGLE_ORG_MODE, value: "true" }
             - name: DEMO_USER_EMAIL
               valueFrom: { secretKeyRef: { name: tracedown-secrets, key: DEMO_USER_EMAIL } }
             - name: DEMO_USER_PASSWORD
@@ -167,8 +201,9 @@ spec:
             - { name: STORAGE_FILESYSTEM_ROOT, value: /data/bodies }
             - { name: DEPLOYMENT_ENV, value: "${deploy_env}" }
             - { name: WS_URL, value: "${ws_url}" }
+            - { name: APP_URL, value: "${app_url}" }
             - { name: EMAIL_PROVIDER, value: "${TD_EMAIL_MODE/none/console}" }
-            - { name: EMAIL_FROM_ADDRESS, value: "${TD_EMAIL_FROM:-}" }
+            - { name: EMAIL_FROM_ADDRESS, value: "${TD_EMAIL_FROM:-noreply@tracedown.dev}" }
             - { name: SMTP_HOST, value: "${TD_SMTP_HOST:-}" }
             - { name: SMTP_PORT, value: "${TD_SMTP_PORT:-587}" }
             - { name: SMTP_USERNAME, value: "${TD_SMTP_USERNAME:-}" }
@@ -182,10 +217,31 @@ spec:
           ports:
             - { containerPort: 20714 }
             - { containerPort: 20870 }
-          readinessProbe:
+          # The two endpoints answer different questions and must not be
+          # crossed over. /ping is deliberately static: it says the process is
+          # up, and nothing it touches can fail — so a restart is never
+          # triggered by a database or Redis outage that restarting cannot fix.
+          # /health actually exercises the pools and returns 503 when a
+          # required dependency is down, which is exactly a readiness answer:
+          # take the pod out of the Service, leave it running, put it back when
+          # the dependency returns.
+          livenessProbe:
             httpGet: { path: /ping, port: 20714 }
-            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /health, port: 20714 }
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          # The jar is fetched by an initContainer and a cold JVM plus Flyway
+          # can take a while; the startup probe carries that window so the
+          # liveness probe above can stay short afterwards.
+          startupProbe:
+            httpGet: { path: /ping, port: 20714 }
+            periodSeconds: 5
+            failureThreshold: 60
           volumeMounts:
             - { name: app, mountPath: /app }
             - { name: bodies, mountPath: /data/bodies }
@@ -256,11 +312,15 @@ YAML
   fi
 
   say "Done."
+  local dashboard
   if [ -n "$TD_INGRESS_HOST" ]; then
-    note "Dashboard: http://${TD_INGRESS_HOST}/ once the Ingress resolves (add TLS!)."
+    dashboard="http://${TD_INGRESS_HOST}/"
+    note "Dashboard: ${dashboard} once the Ingress resolves (add TLS!)."
   else
+    dashboard="http://127.0.0.1:20714"
     note "No Ingress: kubectl -n ${TD_NAMESPACE} port-forward svc/tracedown 20714:20714"
-    note "then open http://127.0.0.1:20714"
+    note "then open ${dashboard}"
   fi
+  report_first_login "$dashboard" "$(pwd)/tracedown.yaml"
   note "Docs: ${DOCS}/install/monolith/"
 }

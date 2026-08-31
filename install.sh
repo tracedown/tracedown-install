@@ -43,7 +43,14 @@ die()  { printf '\033[1;31mERROR\033[0m %s\n' "$*" >&2; exit 1; }
 
 # Prompts must reach the terminal even under `curl | bash` (stdin is the
 # script). Pre-answered prompts (TD_* env) never need a terminal at all.
-if [ -t 0 ]; then TTY=/dev/stdin; elif [ -e /dev/tty ]; then TTY=/dev/tty; else TTY=""; fi
+# Existing is not the same as usable: a container or a CI runner commonly has
+# a /dev/tty node that cannot be opened. Testing the open (in a subshell, so
+# nothing is consumed) is what makes an unattended run fail with the message
+# naming the variable to pre-answer, instead of on a redirect deep inside a
+# prompt.
+if [ -t 0 ]; then TTY=/dev/stdin
+elif [ -e /dev/tty ] && (: < /dev/tty) 2>/dev/null; then TTY=/dev/tty
+else TTY=""; fi
 
 # prompt VAR "question" "default"
 prompt() {
@@ -65,6 +72,11 @@ need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required. Install it an
 hex32() { openssl rand -hex 32; }
 b64secret() { openssl rand -base64 48 | tr -d '\n'; }
 
+# A password that satisfies the platform policy by construction: the literal
+# 'T' is the uppercase, '7' the digit, '!' the special, and the random middle
+# carries the length.
+gen_password() { printf 'T%s7!' "$(openssl rand -base64 18 | tr -d '\n=+/')"; }
+
 latest_backend_version() {
   curl -fsSL "https://api.github.com/repos/${BACKEND_REPO}/releases/latest" \
     | grep -o '"tag_name": *"v[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/'
@@ -81,6 +93,106 @@ wait_for_ping() { # wait_for_ping <url> <seconds>
     fi
   done
   say "Healthy."
+}
+
+# ── the first account ────────────────────────────────────────────────────────
+#
+# SINGLE_ORG_MODE is the only code path in the platform that creates a user:
+# invites and `--create-org` both need one to exist already. It is OFF by
+# default in the platform's own configuration, so every mode that collects
+# admin credentials must also turn it on — otherwise the install comes up with
+# an empty user table and no way in.
+#
+# The credentials themselves are validated HERE rather than at container start.
+# The platform ships a bootstrap identity in its source repository, and under
+# DEPLOYMENT_ENV=production the gateway refuses to start while either value is
+# still that published one, or while the password fails the password policy.
+# There is no override. Discovering that from a crash-looping container is a
+# bad first five minutes, so the prompt applies the same rules.
+#
+# The rules are applied unconditionally, not only when this install happens to
+# set DEPLOYMENT_ENV=production: every mode tells the operator to turn
+# production on later, and a bootstrap account whose password is published is
+# not worth shipping in the first place.
+PUBLISHED_DEMO_EMAIL="admin@tracedown.dev"
+PUBLISHED_DEMO_PASSWORD="Down2trace!"
+
+# Echoes one line per unmet requirement — the gateway's PASSWORD_MIN_* policy
+# (defaults: 8 characters, 1 uppercase, 1 digit, 1 special). Empty output means
+# the password is acceptable.
+password_problems() {
+  local pw="$1"
+  [ "${#pw}" -ge 8 ] || printf 'at least 8 characters\n'
+  case "$pw" in *[A-Z]*) ;; *) printf 'at least 1 uppercase letter\n' ;; esac
+  case "$pw" in *[0-9]*) ;; *) printf 'at least 1 digit\n' ;; esac
+  case "$pw" in *[!A-Za-z0-9]*) ;; *) printf 'at least 1 special character\n' ;; esac
+}
+
+# Sets TD_DEMO_EMAIL and TD_DEMO_PASSWORD to values the platform will accept,
+# and TD_DEMO_PASSWORD_GENERATED=yes when the password was generated here (the
+# mode then prints it, because nobody typed it).
+#
+# A pre-answered TD_* that fails the rules is a hard error rather than a silent
+# retry: without a terminal there is nowhere to ask again.
+prompt_admin() {
+  local tries=0 problems
+
+  while :; do
+    prompt TD_DEMO_EMAIL "Admin login email (the first account — nothing else can create one)" ""
+    if [ -z "$TD_DEMO_EMAIL" ]; then
+      problems="an admin email is required"
+    elif [ "$TD_DEMO_EMAIL" = "$PUBLISHED_DEMO_EMAIL" ]; then
+      problems="'$PUBLISHED_DEMO_EMAIL' is published in the platform's source repository; it is refused as a bootstrap identity. Use your own address."
+    else
+      break
+    fi
+    [ -n "$TTY" ] || die "TD_DEMO_EMAIL cannot be used: $problems"
+    warn "$problems"
+    TD_DEMO_EMAIL=""
+    tries=$((tries + 1))
+    [ "$tries" -lt 5 ] || die "No usable admin email after 5 attempts."
+  done
+
+  tries=0
+  local generated=""
+  while :; do
+    if [ -z "${TD_DEMO_PASSWORD-}" ]; then
+      generated="$(gen_password)"
+      # Unattended: nobody is here to accept the offered default.
+      [ -n "$TTY" ] || TD_DEMO_PASSWORD="$generated"
+    fi
+    prompt TD_DEMO_PASSWORD "Admin login password (empty accepts the generated one)" "$generated"
+
+    problems=""
+    [ "$TD_DEMO_PASSWORD" != "$PUBLISHED_DEMO_PASSWORD" ] \
+      || problems="it is the password published in the platform's source repository"
+    if [ -z "$problems" ]; then
+      problems="$(password_problems "$TD_DEMO_PASSWORD" | tr '\n' '|' | sed 's/|$//; s/|/; /g')"
+      [ -z "$problems" ] || problems="the password policy requires $problems"
+    fi
+    [ -n "$problems" ] || break
+
+    [ -n "$TTY" ] || die "TD_DEMO_PASSWORD cannot be used: $problems"
+    warn "Password rejected: $problems"
+    TD_DEMO_PASSWORD=""
+    tries=$((tries + 1))
+    [ "$tries" -lt 5 ] || die "No usable admin password after 5 attempts."
+  done
+
+  TD_DEMO_PASSWORD_GENERATED=no
+  [ "$TD_DEMO_PASSWORD" != "$generated" ] || TD_DEMO_PASSWORD_GENERATED=yes
+}
+
+# Tells the operator how to get in, and prints the password when they never
+# typed it. Also states the one post-install step SINGLE_ORG_MODE carries.
+report_first_login() { # report_first_login <url> <where-to-turn-it-off>
+  note "Log in at $1 as ${TD_DEMO_EMAIL}"
+  if [ "${TD_DEMO_PASSWORD_GENERATED:-no}" = "yes" ]; then
+    note "Generated password: ${TD_DEMO_PASSWORD}   <- save this now"
+  fi
+  note "SINGLE_ORG_MODE created that account and its organization. Once you have"
+  note "signed in, set it to false in $2 and restart; add further"
+  note "organizations with 'api-gateway --create-org <name> --owner <email>'."
 }
 
 # Email decides the security posture: with a real provider the stack runs
