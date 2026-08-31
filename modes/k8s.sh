@@ -52,7 +52,7 @@ stringData:
   DB_PASSWORD: "$(openssl rand -hex 16)"
   DEMO_USER_EMAIL: "${TD_DEMO_EMAIL}"
   DEMO_USER_PASSWORD: "${TD_DEMO_PASSWORD}"
-  SMTP_PASSWORD: "${TD_SMTP_PASSWORD:-}"
+  EMAIL_SMTP_PASSWORD: "${TD_SMTP_PASSWORD:-}"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -204,16 +204,11 @@ spec:
             - { name: APP_URL, value: "${app_url}" }
             - { name: EMAIL_PROVIDER, value: "${TD_EMAIL_MODE/none/console}" }
             - { name: EMAIL_FROM_ADDRESS, value: "${TD_EMAIL_FROM:-noreply@tracedown.dev}" }
-            - { name: SMTP_HOST, value: "${TD_SMTP_HOST:-}" }
-            - { name: SMTP_PORT, value: "${TD_SMTP_PORT:-587}" }
-            - { name: SMTP_USERNAME, value: "${TD_SMTP_USERNAME:-}" }
-            - name: SMTP_PASSWORD
-              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: SMTP_PASSWORD } }
             - { name: EMAIL_SMTP_HOST, value: "${TD_SMTP_HOST:-}" }
             - { name: EMAIL_SMTP_PORT, value: "${TD_SMTP_PORT:-587}" }
             - { name: EMAIL_SMTP_USERNAME, value: "${TD_SMTP_USERNAME:-}" }
             - name: EMAIL_SMTP_PASSWORD
-              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: SMTP_PASSWORD } }
+              valueFrom: { secretKeyRef: { name: tracedown-secrets, key: EMAIL_SMTP_PASSWORD } }
           ports:
             - { containerPort: 20714 }
             - { containerPort: 20870 }
