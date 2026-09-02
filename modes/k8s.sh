@@ -83,7 +83,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          image: postgres:18-alpine
           env:
             - { name: POSTGRES_DB, value: tracedown }
             - { name: POSTGRES_USER, value: tracedown }
@@ -104,7 +104,8 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 5
             failureThreshold: 3
-          volumeMounts: [{ name: pgdata, mountPath: /var/lib/postgresql/data }]
+          # PostgreSQL 18 images keep the cluster at /var/lib/postgresql/18/docker, so the volume mounts the parent — not the pre-18 /var/lib/postgresql/data.
+          volumeMounts: [{ name: pgdata, mountPath: /var/lib/postgresql }]
       volumes:
         - name: pgdata
           persistentVolumeClaim: { claimName: tracedown-pgdata }
