@@ -78,12 +78,13 @@ name: tracedown-monolith
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_DB: tracedown
       POSTGRES_USER: tracedown
       POSTGRES_PASSWORD: ${DB_PASSWORD}
-    volumes: [pgdata:/var/lib/postgresql/data]
+    # PostgreSQL 18 images keep the cluster at /var/lib/postgresql/18/docker, so the volume mounts the parent — not the pre-18 /var/lib/postgresql/data.
+    volumes: [pgdata:/var/lib/postgresql]
     restart: unless-stopped
 
   redis:
